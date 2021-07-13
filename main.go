@@ -4,16 +4,21 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
+	"github.com/antonmedv/expr"
 	"github.com/crowdsecurity/crowdsec/pkg/csconfig"
 	"github.com/crowdsecurity/crowdsec/pkg/cwhub"
 	"github.com/crowdsecurity/crowdsec/pkg/exprhelpers"
 	leaky "github.com/crowdsecurity/crowdsec/pkg/leakybucket"
 	"github.com/crowdsecurity/crowdsec/pkg/parser"
 	"github.com/crowdsecurity/crowdsec/pkg/types"
+	"gopkg.in/yaml.v2"
 )
 
 func main() {
@@ -23,11 +28,16 @@ func main() {
 		confFile    string
 		confDir     string
 		showAll     bool
+		parseOnly   bool
 		nShow       int
+
+		buckets []leaky.BucketFactory
 	)
+
 	flag.StringVar(&cfgType, "type", "syslog", "type to assign")
 	flag.StringVar(&confFile, "c", "/etc/crowdsec/config.yaml", "configuration file to use")
 	flag.BoolVar(&showAll, "all", false, "show all line results (verbose)")
+	flag.BoolVar(&parseOnly, "parse", false, "parse ONLY. no scenarios loaded")
 	flag.IntVar(&nShow, "n", 0, "how many lines to show (default: 0, unlimited)")
 	flag.Parse()
 
@@ -89,9 +99,40 @@ func main() {
 			csParsers.StageFiles = append(csParsers.StageFiles, stagefile)
 		}
 	}
+	if csParsers.StageFiles != nil {
+		sort.Slice(csParsers.StageFiles, func(i, j int) bool {
+			return csParsers.StageFiles[i].Filename < csParsers.StageFiles[j].Filename
+		})
+	}
+	if !parseOnly {
+		// Load the overflow parsers if we are considering scenarios
+		for _, hubParserItem := range cwhub.GetItemMap(cwhub.PARSERS_OVFLW) {
+			if hubParserItem.Installed {
+				stagefile := parser.Stagefile{
+					Filename: hubParserItem.LocalPath,
+					Stage:    hubParserItem.Stage,
+				}
+				csParsers.PovfwStageFiles = append(csParsers.PovfwStageFiles, stagefile)
+			}
+		}
+		if csParsers.PovfwStageFiles != nil {
+			sort.Slice(csParsers.PovfwStageFiles, func(i, j int) bool {
+				return csParsers.PovfwStageFiles[i].Filename < csParsers.PovfwStageFiles[j].Filename
+			})
+		}
+	}
 
 	if csParsers, err = parser.LoadParsers(config, csParsers); err != nil {
 		log.Fatal(fmt.Sprintf("Unable to laod parsers. %s", err))
+	}
+
+	if !parseOnly {
+		// Load scenarios
+		for _, hubScenarioItem := range cwhub.GetItemMap(cwhub.SCENARIOS) {
+			if hubScenarioItem.Installed {
+				buckets = append(buckets, loadScenario(config.Crowdsec, hubScenarioItem.LocalPath)...)
+			}
+		}
 	}
 
 	fmt.Print("\nScanning file until ")
@@ -103,7 +144,11 @@ func main() {
 			fmt.Print(" is")
 		}
 	}
-	fmt.Print(" found...\n\n")
+	fmt.Print(" found...\n")
+	if parseOnly {
+		fmt.Println("Scenarios will NOT be tested due to -parse option.")
+	}
+	fmt.Println()
 
 	scanner := bufio.NewScanner(file)
 	l := types.Line{Labels: labels, Src: fileToParse, Process: true, Module: "file"}
@@ -139,7 +184,12 @@ func main() {
 			}
 		}
 		fmt.Println()
-		if nShow > 0 && nParsed >= nShow {
+
+		if !parseOnly && parsed.Process {
+			checkScenarios(parsed, buckets)
+		}
+
+		if (nShow > 0 && nParsed >= nShow) || (showAll && nShow != 0 && nScanned >= nShow) {
 			fmt.Printf("\n\nScanned a total of %d lines to find %d matches\n", nScanned, nShow)
 			break
 		}
@@ -155,4 +205,89 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func loadScenario(cscfg *csconfig.CrowdsecServiceCfg, bucketFilename string) []leaky.BucketFactory {
+	var factories []leaky.BucketFactory
+	if !strings.HasSuffix(bucketFilename, ".yaml") {
+		fmt.Printf("Skipping scenario '%s' : not a yaml file", bucketFilename)
+		return factories
+	}
+
+	//process the yaml
+	bucketConfigurationFile, err := os.Open(bucketFilename)
+	if err != nil {
+		fmt.Printf("Can't access leaky configuration file %s\n", bucketFilename)
+		return factories
+	}
+	dec := yaml.NewDecoder(bucketConfigurationFile)
+	dec.SetStrict(true)
+	for {
+		bucketFactory := leaky.BucketFactory{}
+		err = dec.Decode(&bucketFactory)
+		if err != nil {
+			if err == io.EOF {
+				break
+			} else {
+				fmt.Printf("Bad yaml in %s : %v\n", bucketFilename, err)
+				return factories
+			}
+		}
+		bucketFactory.DataDir = cscfg.DataDir
+
+		if bucketFactory.Name == "" {
+			fmt.Printf("  Scenario in %s lacks Name. Won't be loaded.\n", bucketFilename)
+			return factories
+		}
+		fmt.Printf("  Scenario: %s\n", bucketFactory.Name)
+
+		bucketFactory.Filename = filepath.Clean(bucketFilename)
+		err = leaky.LoadBucket(&bucketFactory, nil)
+		if err != nil {
+			fmt.Printf("    Failed to load bucket %s : %v\n", bucketFactory.Name, err)
+			return factories
+		}
+
+		fmt.Println("    loaded OK")
+		factories = append(factories, bucketFactory)
+	}
+	return factories
+}
+
+func checkScenarios(parsed types.Event, holders []leaky.BucketFactory) {
+	var matched []string
+
+	for _, holder := range holders {
+		if holder.RunTimeFilter != nil {
+			output, err := expr.Run(holder.RunTimeFilter, exprhelpers.GetExprEnv(map[string]interface{}{"evt": &parsed}))
+			if err != nil {
+				fmt.Printf("Error parsing filter for %s: %v\n", holder.Name, err)
+				continue
+			}
+
+			var condition, ok bool
+			if condition, ok = output.(bool); !ok {
+				fmt.Printf("Error with filter for %s: non-bool return from %T\n", holder.Name, output)
+				fmt.Println("Skipping...")
+				continue
+			}
+			if condition {
+				matched = append(matched, holder.Name)
+			}
+		}
+	}
+	if len(matched) == 0 {
+		fmt.Println("NO scenarios matched this event")
+	} else {
+		fmt.Printf("Processed by %d ", len(matched))
+		if len(matched) == 1 {
+			fmt.Println("scenario")
+		} else {
+			fmt.Println("scenarios")
+		}
+		for _, scen := range matched {
+			fmt.Printf("    - %s\n", scen)
+		}
+	}
+	fmt.Println()
 }
